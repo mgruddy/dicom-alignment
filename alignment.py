@@ -7,8 +7,7 @@ from contour import *
 from scipy.interpolate import RegularGridInterpolator
 
 # here object (dcm) refers to a pydicom.dataset.FileDataset object
-
-def get_dicom_files(path, modality=None):
+def get_dicom_files(path, modality=None, fname=False):
     """
     Returns all DICOM files in a directory; user can specify a specific modality
     
@@ -36,19 +35,25 @@ def get_dicom_files(path, modality=None):
     for fpath in fpaths:
         f = dicom.read_file(fpath)
         if f.Modality == modality:
-            dicom_files.append(f)
+            if fname == False:
+                dicom_files.append(f)
+            else:
+                dicom_files.append(fpath)
 
-    if (modality in ['RTDOSE', 'RTPLAN', 'RTSTRUCT']) and (len(dicom_files) > 1):
-        warnings.warn(f"There are multiple {modality} files, returning the last one!")
-        return dicom_files
-    elif len(dicom_files) == 0:
-        print(f"No {modality} file(s) found in directory.")
-        return None
+    if (modality in ['RTDOSE', 'RTPLAN', 'RTSTRUCT']):
+        if len(dicom_files) > 1:
+            warnings.warn(f"There are multiple {modality} files, returning the last one!")
+            return dicom_files
+        elif len(dicom_files) == 0:
+            print(f"No {modality} file(s) found in directory.")
+            return None
+        else:
+            dicom_dataset = dicom_files[0]
+            return dicom_dataset
     else:
-        dicom_dataset = dicom_files[0]
-        return dicom_dataset
+        return dicom_files
     
-def Rx_dose_from_plan(plan_file, target_names=['TARGET']):
+def Rx_dose_from_plan(plan_file, target_names=['target']):
     """
     Given a plan file (a DICOM dataset object with modality RTPLAN) find
         the prescription dose in Grays. Prints the Prescription Description if
@@ -73,11 +78,17 @@ def Rx_dose_from_plan(plan_file, target_names=['TARGET']):
         return Rx_descrip
     
     for organ in dose_ref_seq:
-        if organ["300a", '0020'].value in target_names:
+        if organ["300a", '0020'].value.lower() in target_names:
             Rx = float(organ["300a", '0026'].value)
             return Rx
     print("No target volume found...")
-    print("Check that Dose Reference Type is labeled 'TARGET', and edit target_names argument.")
+    print("Check that Dose Reference Type is labeled 'target', and edit target_names argument.")
+    try:
+        Rx_descrip = plan_file.PrescriptionDescription
+    except:
+        print("No Precription Description either!")
+        return None
+    return Rx_descrip
 
 def get_CT_ordered_slices(path):
     """
@@ -91,7 +102,7 @@ def get_CT_ordered_slices(path):
             to slices of a CT scan, ordered by slice number
     """
     slices = get_dicom_files(path, modality="CT")
-    assert slices == list, "Only one CT file found!"
+    assert type(slices) == list, "Only one CT file found!"
     slices = [(s, s.ImagePositionPatient[-1]) for s in slices]
     slices = sorted(slices, key=operator.itemgetter(1))
     sorted_slices = [slc[0] for slc in slices]
@@ -108,8 +119,8 @@ def get_CT_array(path):
     Outputs:
         CT_array (numpy array): A numpy array corresponding to a 3D CT scan
     """
-    slices = [slc.pixel_array for slc in get_ordered_CT_slices(path)]
-    CT_array = np.array(CT_slices)
+    slices = [slc.pixel_array for slc in get_CT_ordered_slices(path)]
+    CT_array = np.array(slices)
     CT_array = np.transpose(CT_array,(1,2,0))
     return CT_array
 
@@ -133,8 +144,8 @@ def get_dose_array(path, Rx_normalization=None):
     dose_array = np.transpose(dose_array, (1,2,0))
     if Rx_normalization:
         Gy_scale_factor = dose_data.DoseGridScaling
-        dose_array * Gy_scale_factor
-        dose_array / Rx_normalization
+        dose_array = dose_array * Gy_scale_factor
+        dose_array = dose_array / Rx_normalization
     return dose_array
 
 def spacing_from_dicom(dicom_dataset):
@@ -190,7 +201,7 @@ def get_CT_voxel_data(path):
         CT_spacing (list of floats):  The 3D coordinates of the first voxel of the corresponding
             CT scan 3D array (in millimeters) given in columns, rows, depth
     """
-    slices = get_ordered_CT_slices(path)
+    slices = get_CT_ordered_slices(path)
     
     assert all([(orientation_from_dicom(slc) ==
                  [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]) for slc in slices]), "Not yet implemented for this ImageOrientation."
@@ -198,12 +209,15 @@ def get_CT_voxel_data(path):
     assert all([(spacing_from_dicom(slc) ==
                      spacing_from_dicom(slices[0])) for slc in slices]), "Slices have different spacings!"
     CT_spacing = spacing_from_dicom(slices[0])
+    CT_spacing = [CT_spacing[1], CT_spacing[0], CT_spacing[2]]
     
     # check for slice thickness errors
-    assert all([((origin_from_dicom(slices[i])[-1] - origin_from_dicom(slices[i-1])[-1]) ==
-                 CT_spacing[-1]) for i in range(1,len(slices))]), "Slice thickness is incorrect."
+    assert all([(round(origin_from_dicom(slices[i])[-1] - origin_from_dicom(slices[i-1])[-1],5) == CT_spacing[-1]) or 
+                (round(origin_from_dicom(slices[i])[-1] - origin_from_dicom(slices[i-1])[-1],5) == 0)
+                for i in range(1,len(slices))]), "Slice thickness is incorrect."
     
     CT_origin = origin_from_dicom(slices[0])
+    CT_origin = [CT_origin[1], CT_origin[0], CT_origin[2]]
     
     xy_shape = slices[0].pixel_array.shape
     CT_shape = (xy_shape[0], xy_shape[1], len(slices))
@@ -229,14 +243,17 @@ def get_dose_voxel_data(path):
               == [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]), "Not yet implemented for this ImageOrientation."
     
     dose_origin = origin_from_dicom(dose_data)
+    dose_origin = [dose_origin[1], dose_origin[0], dose_origin[2]]
+    
     dose_spacing = spacing_from_dicom(dose_data)
+    dose_spacing = [dose_spacing[1], dose_spacing[0], dose_spacing[2]]
+    
     dose_shape = np.transpose(dose_data.pixel_array, (1,2,0)).shape
     
     return dose_shape, dose_origin, dose_spacing
 
 def align_3d_arrays(trasforming_array_origin, transforming_array_spacing, transforming_array,
-                    fixed_array_origin, fixed_array_spacing, fixed_array_shape, fill_value=0.0)
-    trsfm_shape = transforming_array.shape
+                    fixed_array_origin, fixed_array_spacing, fixed_array_shape, fill_value=0.0):
     '''
     Aligns the values of one 3D array to the voxels of another 3D array via interpolation.
     NOTE: This function is dimension agnostic. As long as *ALL* of the spacings and origins match,
@@ -259,6 +276,7 @@ def align_3d_arrays(trasforming_array_origin, transforming_array_spacing, transf
     Outputs:
         transformed_array (numpy array): interpolated array
     '''
+    trsfm_shape = transforming_array.shape
     # compute the dose grid in terms of physical coordinates
     x1_values = np.array([float(trasforming_array_origin[0])+i*float(transforming_array_spacing[0])
                           for i in range(trsfm_shape[0])])
@@ -323,7 +341,7 @@ def get_roi_index(contour_data, name):
         warnings.warn(f"Contour {name} is not in contour dataset!")
     else:
         roi_idx = get_roi_names(contour_data).index(name)
-        return roi_index
+        return roi_idx
 
 def percent_volume_Rx(organ_mask, normalized_dose_array, Rx_value):
     """
@@ -370,6 +388,4 @@ def get_center_slice(mask, dim=0):
     last = max(slices)
     slc = int((last + first) / 2)
     return slc
-    
-    
     
